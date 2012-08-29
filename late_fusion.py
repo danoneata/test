@@ -3,7 +3,7 @@ from ipdb import set_trace
 import itertools
 import multiprocessing as mp
 import numpy as np
-from sklearn import svm
+from sklearn.svm import SVC
 from sklearn.cross_validation import StratifiedShuffleSplit
 from sklearn.grid_search import GridSearchCV
 
@@ -44,7 +44,7 @@ idx_to_class = {
 
 class LateFusion(object):
     def __init__(self):
-        self.score_type = 'probas'
+        self.score_type = 'scores'
 
     def fit(self, kernels, labels):
         scores, self.clf = [], []
@@ -115,6 +115,11 @@ class LateFusion(object):
             yield ww + (last_weight, )
 
 
+class MySVC(SVC):
+    def predict(self, X):
+        return self.decision_function(X)
+
+
 class SVM(object):
     def __init__(self, **kwargs):
         self.nr_processes = kwargs.get('nr_processes', 1)
@@ -124,7 +129,7 @@ class SVM(object):
     def fit(self, tr_kernel, tr_labels):
         splits = StratifiedShuffleSplit(
             tr_labels, 3, test_size=0.25, random_state=0)
-        my_clf = svm.SVC(kernel='precomputed',probability=True,
+        my_clf = MySVC(kernel='precomputed',probability=True,
                          class_weight='auto')
         self.clf = (
             GridSearchCV(my_clf, self.parameters,
@@ -168,11 +173,13 @@ def kernels_given_class(
 
 
 def get_kernels():
+    # Load dummy data.
     #filename = ('/home/clear/oneata/data/trecvid12/scripts/fusion/'
     #            'dummy_kernel_data.pickle')
     #with open(filename, 'r') as ff:
     #    tr_kernels, te_kernels, tr_labels, te_labels = cPickle.load(ff)
     #return tr_kernels, te_kernels, tr_labels, te_labels
+
     features = ['color', 'sift', 'mbh']
     params = {
         'sift': {'subsample': 10, 'nr_clusters': 64, 'color': 0},
