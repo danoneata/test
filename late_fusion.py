@@ -6,12 +6,16 @@ import numpy as np
 from sklearn.svm import SVC
 from sklearn.cross_validation import StratifiedShuffleSplit
 from sklearn.grid_search import GridSearchCV
+import sys
 
-import per_video
+from per_video import data_to_kernels
+from per_video import get_data
+from per_video import remap_descriptors
 from per_slice import binarize_labels
 from fisher_vectors.evaluation.utils import average_precision
 
 
+null_class_idx = 0
 idx_to_class = {
      0: 'null',
      1: 'board_trick',
@@ -42,9 +46,24 @@ idx_to_class = {
 }
 
 
+combinations = {
+    'sift_mu':       ('sift2', {'dimensions' : (255, 255 + 32 * 256) }),
+    'sift_sigma':    ('sift2', {'dimensions' : (255 + 32 * 256, 255 + 32 * 256 * 2) }),
+    'sift_mu_sigma': ('sift2', {'dimensions' : (255, 255 + 32 * 256 * 2) }),
+    'mbh':           ('mbh', {}),
+    'audio':         ('heng_audio', {'derivative': ''}),
+    'audio_D1':      ('heng_audio', {'derivative': '_D1'}),
+    'audio_D2':      ('heng_audio', {'derivative': '_D2'}),
+    'jochen_audio':  ('jochen_audio',{'dimslice': 0})}
+
+
+late_fusion_params = {
+    'score_type': 'scores'}
+
+
 class LateFusion(object):
-    def __init__(self):
-        self.score_type = 'scores'
+    def __init__(self, score_type):
+        self.score_type = score_type
 
     def fit(self, kernels, labels):
         scores, self.clf = [], []
@@ -149,63 +168,87 @@ class SVM(object):
         return average_precision(te_labels, self.predict_proba(te_kernel))
 
 
-def kernels_given_class(
-    tr_kernels, te_kernels, tr_labels, te_labels, class_idx):
+def get_kernels_given_class(tr_kernels, te_kernels, tr_labels, te_labels,
+                            class_idx):
+    tr_idxs = ((tr_labels == class_idx) |
+               (tr_labels == null_class_idx))
+    te_idxs = ((te_labels == class_idx) |
+               (te_labels == null_class_idx))
 
-    null_class_idx = 0
-    tr_idxs = (
-        (tr_labels == class_idx) | (tr_labels == null_class_idx))
-    te_idxs = (
-        (te_labels == class_idx) | (te_labels == null_class_idx))
+    tr_kernel_idxs = np.ix_(tr_idxs, tr_idxs)
+    te_kernel_idxs = np.ix_(te_idxs, tr_idxs)
+
+    for tr_kernel, te_kernel in itertools.izip(tr_kernels, te_kernels):
+        yield tr_kernel[tr_kernel_idxs], te_kernel[te_kernel_idxs]
+
+
+def get_labels_given_class(tr_labels, te_labels, class_idx):
+    tr_idxs = ((tr_labels == class_idx) |
+               (tr_labels == null_class_idx))
+    te_idxs = ((te_labels == class_idx) |
+               (te_labels == null_class_idx))
 
     cls_tr_labels = binarize_labels(tr_labels[tr_idxs], pos_label=class_idx,
         neg_label=null_class_idx)
     cls_te_labels = binarize_labels(te_labels[te_idxs], pos_label=class_idx,
         neg_label=null_class_idx)
 
-    tr_kernel_idxs = np.ix_(tr_idxs, tr_idxs)
-    te_kernel_idxs = np.ix_(te_idxs, tr_idxs)
-
-    cls_tr_kernels = (tr_kernel[tr_kernel_idxs] for tr_kernel in tr_kernels)
-    cls_te_kernels = (te_kernel[te_kernel_idxs] for te_kernel in te_kernels)
-
-    return cls_tr_kernels, cls_te_kernels, cls_tr_labels, cls_te_labels
+    return cls_tr_labels, cls_te_labels
 
 
 def get_kernels():
-    # Load dummy data.
-    #filename = ('/home/clear/oneata/data/trecvid12/scripts/fusion/'
-    #            'dummy_kernel_data.pickle')
-    #with open(filename, 'r') as ff:
-    #    tr_kernels, te_kernels, tr_labels, te_labels = cPickle.load(ff)
-    #return tr_kernels, te_kernels, tr_labels, te_labels
+    selection = sys.argv[1:]
 
-    features = ['color', 'sift', 'mbh']
-    params = {
-        'sift': {'subsample': 10, 'nr_clusters': 64, 'color': 0},
-        'color': {'subsample': 10, 'nr_clusters': 64, 'color': 1},
-        'mbh': {}}
-    tr_kernels, te_kernels = [], []
-    for feature in features:
-        tr_data, tr_labels = per_video.get_data(
-            feature, 'train', **params[feature])
-        te_data, te_labels = per_video.get_data(
-            feature, 'test', **params[feature])
+    ref_tr_vidnames = None
+    ref_te_vidnames = None
 
-        tr_kernel, te_kernel = per_video.data_to_kernels(tr_data, te_data)
+    for cname in selection:
+        feature, params = combinations[cname]
 
-        tr_kernels.append(tr_kernel)
-        te_kernels.append(te_kernel)
-    return tr_kernels, te_kernels, tr_labels, te_labels
+        print "load feature", cname
+        
+        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train_balanced', **params)
+        te_data, te_labels, te_vidnames = get_data(feature, 'test_balanced', **params)
+
+        print "compute kernels train %d*%d test %d*%d" % (
+            tr_data.shape + te_data.shape)
+
+        if ref_tr_vidnames != None:
+            print "remapping names"
+            # pdb.set_trace()
+
+            te_data = remap_descriptors(te_data, te_vidnames, ref_te_vidnames)
+            tr_data = remap_descriptors(tr_data, tr_vidnames, ref_tr_vidnames)           
+        else:
+            ref_tr_vidnames = te_vidnames
+            ref_te_vidnames = tr_vidnames
+          
+        tr_kernel, te_kernel = data_to_kernels(tr_data, te_data)
+        yield tr_kernel, te_kernel
 
 
-def per_class_worker(result_queue, tr_kernels, te_kernels, tr_labels,
-                     te_labels, class_idx):
-    late_fusion = LateFusion()
+def get_labels():
+    selection = sys.argv[1:]
+    for cname in selection:
+        feature, params = combinations[cname]
+        _, tr_labels, _ = get_data(feature, 'train_balanced', **params)
+        _, te_labels, _ = get_data(feature, 'test_balanced', **params)
+        return tr_labels, te_labels
+
+
+def per_class_worker(result_queue, class_idx):
+    # Load data.
+    tr_kernels, te_kernels = get_kernels()
+    tr_labels, te_labels = get_labels()
+
     # Binarize labels + slice kernels.
-    (cls_tr_kernels, cls_te_kernels,
-     cls_tr_labels, cls_te_labels) = kernels_given_class(
+    cls_tr_kernels, cls_te_kernels = get_kernels_given_class(
         tr_kernels, te_kernels, tr_labels, te_labels, class_idx)
+    cls_tr_labels, cls_te_labels = get_labels_given_class(
+        tr_labels, te_labels, class_idx)
+
+    # Train SVC for each channel, then late fuse.
+    late_fusion = LateFusion(**late_fusion_params)
     late_fusion.fit(cls_tr_kernels, cls_tr_labels)
     score = 100 * late_fusion.score(cls_te_kernels, cls_te_labels)
     result_queue.put((class_idx, score, late_fusion.get_weights_str()))
@@ -213,13 +256,11 @@ def per_class_worker(result_queue, tr_kernels, te_kernels, tr_labels,
 
 def late_fusion_master():
     processes, result_queue = [], mp.Queue()
-    tr_kernels, te_kernels, tr_labels, te_labels = get_kernels()
     for class_idx in xrange(1, 16):
         processes.append(
             mp.Process(
                 target=per_class_worker,
-                args=(result_queue, tr_kernels, te_kernels, tr_labels,
-                      te_labels, class_idx)))
+                args=(result_queue, class_idx)))
         processes[-1].start()
     for process in processes:
         process.join()
