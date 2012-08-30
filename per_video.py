@@ -6,6 +6,7 @@ import os
 import pdb
 import random
 from sklearn import cross_validation
+from sklearn.preprocessing import Scaler
 import sys
 
 import descriptors
@@ -385,11 +386,14 @@ def get_data(features, split, **kwargs):
 
 
 def data_to_kernels(tr_data, te_data):
-    tr_data, mu, sigma = standardize(tr_data)
+    scaler = Scaler(copy=False)
+    scaler.fit_transform(tr_data)
+    #tr_data, mu, sigma = standardize(tr_data)
     tr_data = power_normalize(tr_data, 0.5)
     tr_data = L2_normalize(tr_data)
 
-    te_data, _, _ = standardize(te_data, mu, sigma)
+    #te_data, _, _ = standardize(te_data, mu, sigma)
+    scaler.transform(te_data)
     te_data = power_normalize(te_data, 0.5)
     te_data = L2_normalize(te_data)
 
@@ -433,8 +437,8 @@ def vary_nr_negatives():
         'mbh': {'suffix': '_morenull'},
         'sift': {'subsample': 10, 'nr_clusters': 64, 'color': 0}}
 
-    tr_data, tr_labels = get_data(feature, 'train', **params[feature])
-    te_data, te_labels = get_data(feature, 'test', **params[feature])
+    tr_data, tr_labels, _ = get_data(feature, 'train', **params[feature])
+    te_data, te_labels, _ = get_data(feature, 'test', **params[feature])
 
     outfilename = '/home/lear/oneata/data/trecvid12/results/tmp.txt'
     with open(outfilename, 'a') as ff:
@@ -494,8 +498,8 @@ def evaluate():
 
         print "load feature", cname, "factor", factor
         
-        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train_balanced', **params)
-        te_data, te_labels, te_vidnames = get_data(feature, 'test_balanced', **params)
+        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train', **params)
+        te_data, te_labels, te_vidnames = get_data(feature, 'test', **params)
 
         print "compute kernels train %d*%d test %d*%d" % (
             tr_data.shape + te_data.shape)
@@ -522,15 +526,14 @@ def evaluate():
             tr_kernel += Kxx
             te_kernel += Kyx        
 
-
     from fisher_vectors.evaluation import trecvid12_parallel as eval
     fit_out = eval.fit(tr_kernel, tr_labels)
     print eval.score(te_kernel, te_labels, fit_out)
 
 
 def main():
-    vary_nr_negatives()
-    #evaluate()
+    #vary_nr_negatives()
+    evaluate()
 
 
 if __name__ == '__main__':
