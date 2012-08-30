@@ -3,6 +3,7 @@ from ipdb import set_trace
 import itertools
 import multiprocessing as mp
 import numpy as np
+from sklearn.linear_model import Lasso
 from sklearn.svm import SVC
 from sklearn.cross_validation import StratifiedShuffleSplit
 from sklearn.grid_search import GridSearchCV
@@ -58,7 +59,17 @@ combinations = {
 
 
 late_fusion_params = {
-    'score_type': 'scores'}
+    'score_type': 'probas'}
+
+
+def weights_grid(dd, step = 0.02):
+    """ Generates weights on a regular grid. """
+    for ww in itertools.product(
+        *(np.arange(0, 1 + step, step) for ii in xrange(dd - 1))):
+        last_weight = 1 - sum(ww)
+        if last_weight < 0:
+            continue
+        yield ww + (last_weight, )
 
 
 class LateFusion(object):
@@ -81,7 +92,9 @@ class LateFusion(object):
             self.clf.append(SVM())
             self.clf[-1].fit(kernel[k_tr_idxs], labels[tr_idxs])
             scores.append(self.predict_clf(self.clf[-1], kernel[k_val_idxs]))
-        self.weights = self._get_late_fusion_weights(scores, labels[val_idxs])
+
+        scores = np.vstack(scores).T
+        self.fit_late_fusion(scores, labels[val_idxs])
 
         # Retrain on all the data.
         for ii, kernel in enumerate(kernels):
@@ -93,7 +106,8 @@ class LateFusion(object):
         scores = []
         for ii, kernel in enumerate(te_kernels):
             scores.append(self.predict_clf(self.clf[ii], kernel))
-        fused_scores = self._fuse_scores(scores, self.weights)
+        scores = np.vstack(scores).T
+        fused_scores = self.predict_late_fusion(scores)
         return fused_scores
 
     def score(self, te_kernels, te_labels):
@@ -108,30 +122,29 @@ class LateFusion(object):
     def get_weights_str(self):
         return ' '.join(['%.2f' % ww for ww in self.weights])
 
-    def _get_late_fusion_weights(self, scores, tr_labels):
-        #return np.array([1. / len(scores)] * len(scores))  # Equal weights.
+    def fit_late_fusion(self, scores, tr_labels):
+        # Equal weights.
+        #D = scores.shape[1]
+        #self.weights = np.array([1. / D] * D)
+
+        # Dumb crossvalidation.
         best_ap = 0
-        for weights in self.weights_grid(len(scores)):
+        D = scores.shape[1]
+        for self.weights in weights_grid(D):
             ap = average_precision(
-                tr_labels, self._fuse_scores(scores, weights))
+                tr_labels, self.predict_late_fusion(scores))
             if ap > best_ap:
                 best_ap = ap
-                best_weights = weights
-        return best_weights
+                best_weights = self.weights
+        self.weights = best_weights
 
-    @staticmethod
-    def _fuse_scores(scores, weights):
-        return np.sum(np.vstack(scores).T * weights, 1)
+        # Fit small regressor, linear model.
+        #self.lm = Lasso()
+        #self.lm.fit(scores, tr_labels)
 
-    @staticmethod
-    def weights_grid(dd, step = 0.02):
-        """ Generates weights on a regular grid. """
-        for ww in itertools.product(
-            *(np.arange(0, 1 + step, step) for ii in xrange(dd - 1))):
-            last_weight = 1 - sum(ww)
-            if last_weight < 0:
-                continue
-            yield ww + (last_weight, )
+    def predict_late_fusion(self, scores):
+        return np.sum(scores * self.weights, 1)
+        #return self.lm.predict(scores)
 
 
 class MySVC(SVC):
@@ -170,6 +183,7 @@ class SVM(object):
 
 def get_kernels_given_class(tr_kernels, te_kernels, tr_labels, te_labels,
                             class_idx):
+
     tr_idxs = ((tr_labels == class_idx) |
                (tr_labels == null_class_idx))
     te_idxs = ((te_labels == class_idx) |
@@ -178,8 +192,13 @@ def get_kernels_given_class(tr_kernels, te_kernels, tr_labels, te_labels,
     tr_kernel_idxs = np.ix_(tr_idxs, tr_idxs)
     te_kernel_idxs = np.ix_(te_idxs, tr_idxs)
 
+    cls_tr_kernels, cls_te_kernels = [], []
+
     for tr_kernel, te_kernel in itertools.izip(tr_kernels, te_kernels):
-        yield tr_kernel[tr_kernel_idxs], te_kernel[te_kernel_idxs]
+        cls_tr_kernels.append(tr_kernel[tr_kernel_idxs])
+        cls_te_kernels.append(te_kernel[te_kernel_idxs])
+
+    return cls_tr_kernels, cls_te_kernels
 
 
 def get_labels_given_class(tr_labels, te_labels, class_idx):
@@ -196,19 +215,21 @@ def get_labels_given_class(tr_labels, te_labels, class_idx):
     return cls_tr_labels, cls_te_labels
 
 
-def get_kernels():
+def get_kernels_and_labels():
     selection = sys.argv[1:]
 
     ref_tr_vidnames = None
     ref_te_vidnames = None
+
+    tr_kernels, te_kernels = [], []
 
     for cname in selection:
         feature, params = combinations[cname]
 
         print "load feature", cname
         
-        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train_balanced', **params)
-        te_data, te_labels, te_vidnames = get_data(feature, 'test_balanced', **params)
+        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train', **params)
+        te_data, te_labels, te_vidnames = get_data(feature, 'test', **params)
 
         print "compute kernels train %d*%d test %d*%d" % (
             tr_data.shape + te_data.shape)
@@ -219,28 +240,20 @@ def get_kernels():
 
             te_data = remap_descriptors(te_data, te_vidnames, ref_te_vidnames)
             tr_data = remap_descriptors(tr_data, tr_vidnames, ref_tr_vidnames)           
+            tr_labels_, te_labels_ = tr_labels, te_labels
         else:
-            ref_tr_vidnames = te_vidnames
-            ref_te_vidnames = tr_vidnames
+            ref_tr_vidnames = tr_vidnames
+            ref_te_vidnames = te_vidnames
           
         tr_kernel, te_kernel = data_to_kernels(tr_data, te_data)
-        yield tr_kernel, te_kernel
+        tr_kernels.append(tr_kernel)
+        te_kernels.append(te_kernel)
+
+    return tr_kernels, te_kernels, tr_labels_, te_labels_
 
 
-def get_labels():
-    selection = sys.argv[1:]
-    for cname in selection:
-        feature, params = combinations[cname]
-        _, tr_labels, _ = get_data(feature, 'train_balanced', **params)
-        _, te_labels, _ = get_data(feature, 'test_balanced', **params)
-        return tr_labels, te_labels
-
-
-def per_class_worker(result_queue, class_idx):
-    # Load data.
-    tr_kernels, te_kernels = get_kernels()
-    tr_labels, te_labels = get_labels()
-
+def per_class_worker(result_queue, tr_kernels, te_kernels, tr_labels,
+                     te_labels, class_idx):
     # Binarize labels + slice kernels.
     cls_tr_kernels, cls_te_kernels = get_kernels_given_class(
         tr_kernels, te_kernels, tr_labels, te_labels, class_idx)
@@ -256,11 +269,15 @@ def per_class_worker(result_queue, class_idx):
 
 def late_fusion_master():
     processes, result_queue = [], mp.Queue()
+
+    # Load data.
+    tr_kernels, te_kernels, tr_labels, te_labels = get_kernels_and_labels()
     for class_idx in xrange(1, 16):
         processes.append(
             mp.Process(
                 target=per_class_worker,
-                args=(result_queue, class_idx)))
+                args=(result_queue, tr_kernels, te_kernels, tr_labels,
+                      te_labels, class_idx)))
         processes[-1].start()
     for process in processes:
         process.join()
@@ -272,19 +289,16 @@ def late_fusion_master():
         [score for _, score, _ in results])
 
 
-late_fusion_master()
+def late_fusion_test():
+    qq = mp.Queue()
+    tr_kernels, te_kernels, tr_labels, te_labels = get_kernels_and_labels()
+    per_class_worker(qq, tr_kernels, te_kernels, tr_labels, te_labels, 1)
 
-# One processor, deprecated.
-#scores = []
-#tr_kernels, te_kernels, tr_labels, te_labels = get_kernels()
-#for class_idx in xrange(15):
-#    late_fusion = LateFusion()
-#    # Binarize labels + slice kernels.
-#    (cls_tr_kernels, cls_te_kernels,
-#     cls_tr_labels, cls_te_labels) = kernels_given_class(
-#        tr_kernels, te_kernels, tr_labels, te_labels, class_idx)
-#    late_fusion.fit(cls_tr_kernels, cls_tr_labels)
-#    scores.append(100 * late_fusion.score(cls_te_kernels, cls_te_labels))
-#    print '%d %2.3f %s' % (
-#        class_idx, scores[-1], late_fusion.get_weights_str())
-#print 'MAP %2.3f' % np.mean(scores)
+
+def main():
+    late_fusion_test()
+    #late_fusion_master()
+
+
+if __name__ == '__main__':
+    main()
