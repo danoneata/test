@@ -59,7 +59,7 @@ combinations = {
 
 
 late_fusion_params = {
-    'score_type': 'probas'}
+    'score_type': 'scores'}
 
 
 def weights_grid(dd, step = 0.02):
@@ -77,24 +77,35 @@ class LateFusion(object):
         self.score_type = score_type
 
     def fit(self, kernels, labels):
-        scores, self.clf = [], []
+        self.clf = []
         kernels = list(kernels)
+        nr_kernels = len(kernels)
 
         # Get a hold-out data for fitting the late fusion weights.
-        ss = StratifiedShuffleSplit(labels, 1, test_size=0.25, random_state=0)
-        tr_idxs, val_idxs = iter(ss).next()
+        self.weight_scores = {}
+        ss = StratifiedShuffleSplit(labels, 3, test_size=0.25, random_state=0)
+        #tr_idxs, val_idxs = iter(ss).next()
         # nr_samples = len(labels)
         # tr_idxs, val_idxs = np.arange(nr_samples), np.arange(nr_samples)
-        k_tr_idxs = np.ix_(tr_idxs, tr_idxs)
-        k_val_idxs = np.ix_(val_idxs, tr_idxs)
-
-        for kernel in kernels:
+        for ii in xrange(nr_kernels):
             self.clf.append(SVM())
-            self.clf[-1].fit(kernel[k_tr_idxs], labels[tr_idxs])
-            scores.append(self.predict_clf(self.clf[-1], kernel[k_val_idxs]))
 
-        scores = np.vstack(scores).T
-        self.fit_late_fusion(scores, labels[val_idxs])
+        for tr_idxs, val_idxs in ss:
+            k_tr_idxs = np.ix_(tr_idxs, tr_idxs)
+            k_val_idxs = np.ix_(val_idxs, tr_idxs)
+
+            scores = []
+            for ii, kernel in enumerate(kernels):
+                self.clf[ii].fit(kernel[k_tr_idxs], labels[tr_idxs])
+                scores.append(
+                    self.predict_clf(self.clf[ii], kernel[k_val_idxs]))
+
+            scores = np.vstack(scores).T
+            self.fit_late_fusion(scores, labels[val_idxs])
+
+        self.weights = max(self.weight_scores,
+                           key=lambda key:
+                           np.mean(self.weight_scores[key]))
 
         # Retrain on all the data.
         for ii, kernel in enumerate(kernels):
@@ -133,10 +144,16 @@ class LateFusion(object):
         for self.weights in weights_grid(D):
             ap = average_precision(
                 tr_labels, self.predict_late_fusion(scores))
-            if ap > best_ap:
-                best_ap = ap
-                best_weights = self.weights
-        self.weights = best_weights
+
+            if self.weights in self.weight_scores:
+                self.weight_scores[self.weights].append(ap)
+            else:
+                self.weight_scores[self.weights] = [ap]
+
+        #    if ap > best_ap:
+        #        best_ap = ap
+        #        best_weights = self.weights
+        #self.weights = best_weights
 
         # Fit small regressor, linear model.
         #self.lm = Lasso()
@@ -296,8 +313,8 @@ def late_fusion_test():
 
 
 def main():
-    late_fusion_test()
-    #late_fusion_master()
+    #late_fusion_test()
+    late_fusion_master()
 
 
 if __name__ == '__main__':
