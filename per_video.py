@@ -14,6 +14,7 @@ from yael.yael import gmm_read
 from yael import ynumpy
 
 from fisher_vectors.evaluation import Evaluation
+from fisher_vectors.evaluation.trecvid12_parallel import chunker
 from fisher_vectors.per_slice.discriminative_detection import aggregate
 from fisher_vectors.per_slice.discriminative_detection import _normalize
 from fisher_vectors.model import FVModel
@@ -50,9 +51,26 @@ label_map = {
     28: 'town_hall_meeting',
     29: 'winning_a_race_without_a_vehicle',
     30: 'working_on_a_metal_crafts_project',
+    31: 'unknown',
 }
 rev_label_map = {name:no for no, name in label_map.items()}
 
+
+combinations = {
+    'sift_mu':       ('sift2', {'dimensions' : (255, 255 + 32 * 256) }),
+    'sift_sigma':    ('sift2', {'dimensions' : (255 + 32 * 256, 255 + 32 * 256 * 2) }),
+    'sift_mu_sigma': ('sift2', {'dimensions' : (255, 255 + 32 * 256 * 2) }),
+    'sift_mu_sigma_T2t1': ('sift2', {'dimensions' : (255, 255 + 32 * 256 * 2), 'temporal_spm': (2, 0) }),
+    'sift_mu_sigma_T2t2': ('sift2', {'dimensions' : (255, 255 + 32 * 256 * 2), 'temporal_spm': (2, 1) }),
+    'mbh':           ('mbh', {}),
+    'mbh_2xnorm':    ('mbh', {'double_norm': True}),
+    'mbh_1024':      ('mbh', {'K': 1024}),
+    'audio':         ('heng_audio', {'derivative': ''}),
+    'audio_D1':      ('heng_audio', {'derivative': '_D1'}),
+    'audio_D2':      ('heng_audio', {'derivative': '_D2'}),
+    'jochen_audio':  ('jochen_audio',{'dimslice': 0}),
+    }
+ 
 
 def normalize_fisher(X):
     """ Power normalization """
@@ -99,13 +117,22 @@ def get_per_video_sift_data_old(split, subsample=1, nr_clusters=64, color=10):
 
 
 def get_per_video_sift_data(split, desc_key = 'framestep60_dense_siftnonorm_lpca32_gmm256_w_mu_sigma',
-                            dimensions = (255, 255 + 32 * 256)):
+                            dimensions = (255, 255 + 32 * 256), **kwargs):
     """
     The descriptor key is a directory name. The dimensions can be used to select mu/w/sigma
     """
+    temporal_spm = kwargs.get('temporal_spm', None)
+    if temporal_spm:
+        suffix = '_T%dt%d' % temporal_spm
+        nr_bags, bag_idx = temporal_spm
+    else:
+        suffix = ''
+        nr_bags, bag_idx = 1, 0
 
     # cache
-    filename = "data/per_video_cache/SIFT_%s_%s.raw" % (desc_key, split)
+    filename = ("/home/lear/oneata/data/trecvid12/scripts/"
+                "fusion/data/per_video_cache/SIFT_%s_%s%s.raw" %
+                (desc_key, split, suffix))
 
     if os.path.exists(filename):
         # Load data from cache file.
@@ -162,7 +189,10 @@ def get_per_video_sift_data(split, desc_key = 'framestep60_dense_siftnonorm_lpca
         fv = normalize_fisher(fv)
 
         # average of descriptors        
-        desc = fv.sum(axis = 0) / fv.shape[0]
+        nr_slices = fv.shape[0]
+        bag_idx = np.minimum(bag_idx, nr_slices - 1)
+        idxs = list(chunker(np.arange(nr_slices), nr_bags))[bag_idx]
+        desc = fv[idxs].sum(axis = 0) / fv[idxs].shape[0]
         video_data.append(desc)
     
     video_data = np.vstack(video_data)
@@ -301,7 +331,7 @@ def get_audio_data_heng(split, derivative = '', missing = '0'):
     data = []
     miss = []
     n_wanted = 0
-    for l in open("data/%s_balanced.list" % split, "r"):
+    for l in open("data/%s.list" % split, "r"):
         l = l[:-1]
         vidname = l.split('-')[0]  
         classname = l.split(' ')[-1]
@@ -325,6 +355,86 @@ def get_audio_data_heng(split, derivative = '', missing = '0'):
     data = np.vstack(data)
     labels = np.array(labels)
     return data, labels, video_names
+
+
+def get_per_video_mbh_data_given_list(list_name, **kwargs):
+    """ Loads the Fisher vectors corresponding to the samples found in the
+    list specified by `list_name`.
+
+    """
+    K = kwargs.get('K', 256)
+    sstats_path = ('/home/clear/oneata/data/trecvid12/features'
+                   '/dense5.track15mbh.small.skip_1/statistics_k_%d' % K)
+
+    # Default base directories.
+    list_base_path = kwargs.get(
+        'list_base_path', '/home/lear/douze/src/experiments/trecvid12/data')
+    cache_base_path = kwargs.get(
+        'cache_base_path', sstats_path)
+    double_norm = kwargs.get('double_norm', False)
+
+    suffix = '.double_norm' if double_norm else ''
+
+    # If this file exists load them directly.
+    cache_filename = os.path.join(cache_base_path, 'mbh_' + list_name + suffix + '.raw')
+    if os.path.exists(cache_filename):
+        print "Loading Fisher vectors from MBH descriptors for list %s..." % (
+            list_name)
+        with open(cache_filename, 'r') as ff:
+            data = np.load(ff)
+            labels = np.load(ff)
+            names = cPickle.load(ff)
+        return data, labels, names
+
+    D = 64
+    data, labels, names = [], [], []
+    sstats_generic_name = os.path.join(sstats_path, 'stats.tmp' + suffix, '%s.dat')
+    list_path = os.path.join(list_base_path, list_name + '.list')
+    gmm_path = os.path.join(sstats_path, 'gmm_%d' % K)
+    gmm = gmm_read(open(gmm_path, 'r'))
+
+    # Get descriptors for the files in list.
+    print "Creating cache file from list %s..." % list_name
+    for line in open(list_path, 'r'):
+        fields = line.split()
+
+        sstats_filename = fields[0]
+        video_name = sstats_filename.split('-')[0]
+        sys.stdout.write("%s\t\r" % video_name)
+
+        try:
+            class_name = fields[1]
+        except IndexError:
+            class_name = 'unknown'
+
+        try:
+            sstats = np.fromfile(sstats_generic_name % sstats_filename,
+                                 dtype=np.float32)
+            if double_norm:
+                fv = sstats
+            else:
+                fv = FVModel.sstats_to_features(sstats, gmm)
+        except IOError:
+            print ('Sufficient statistics for video %s are missing;'
+                   'replacing with zeros.') % video_name
+            fv = np.zeros(K + 2 * K * D)
+
+        data.append(fv)
+        names.append(video_name)
+        labels.append(rev_label_map[class_name])
+
+    data = np.vstack(data)
+    labels = np.array(labels)
+
+    assert data.shape[0] == len(labels), "Data size doesn't match nr of labels"
+
+    # Cache results to file.
+    with open(cache_filename, 'w') as ff:
+        np.save(ff, data)
+        np.save(ff, labels)
+        cPickle.dump(names, ff)
+
+    return data, labels, names
 
 
 def get_per_video_mbh_data(split, suffix=''):
@@ -373,8 +483,7 @@ def get_data(features, split, **kwargs):
     elif features == 'sift2':
         data, labels, vidnames = get_per_video_sift_data(split, **kwargs)
     elif features == 'mbh':
-        suffix = kwargs.get('suffix', '')
-        data, labels, vidnames = get_per_video_mbh_data(split, suffix)        
+        data, labels, vidnames = get_per_video_mbh_data_given_list(split, **kwargs)        
     elif features == 'jochen_audio':
         data, labels, vidnames = get_audio_data_jochen(split, **kwargs)
     elif features == 'heng_audio':
@@ -470,18 +579,6 @@ def vary_nr_negatives():
 
 
 def evaluate():
-    combinations = {
-        'sift_mu':       ('sift2', {'dimensions' : (255, 255 + 32 * 256) }),
-        'sift_sigma':    ('sift2', {'dimensions' : (255 + 32 * 256, 255 + 32 * 256 * 2) }),
-        'sift_mu_sigma': ('sift2', {'dimensions' : (255, 255 + 32 * 256 * 2) }),
-        'mbh':           ('mbh', {}),
-        'audio':         ('heng_audio', {'derivative': ''}),
-        'audio_D1':      ('heng_audio', {'derivative': '_D1'}),
-        'audio_D2':      ('heng_audio', {'derivative': '_D2'}),
-        'jochen_audio':  ('jochen_audio',{'dimslice': 0}),
-        }
-        
-        
     selection = sys.argv[1:]
 
     ref_tr_vidnames = None
@@ -498,8 +595,8 @@ def evaluate():
 
         print "load feature", cname, "factor", factor
         
-        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train', **params)
-        te_data, te_labels, te_vidnames = get_data(feature, 'test', **params)
+        tr_data, tr_labels, tr_vidnames = get_data(feature, 'train_balanced', **params)
+        te_data, te_labels, te_vidnames = get_data(feature, 'test_balanced', **params)
 
         print "compute kernels train %d*%d test %d*%d" % (
             tr_data.shape + te_data.shape)
